@@ -1,0 +1,37 @@
+### Local generated checkouts
+lineage-device-work/
+display-panels/
+
+### Python
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+.venv/
+venv/
+env/
+ENV/
+
+### Build and test output
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+### Local tooling and logs
+.codex
+*.log
+*.tmp
+*.swp
+*.swo
+
+### Editors and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
