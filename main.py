@@ -49,6 +49,7 @@ from typing import Iterable, Iterator, Optional
 # Android framework resource names commonly used for display cutouts/corners.
 CUTOUT_RESOURCE = "config_mainBuiltInDisplayCutout"
 CUTOUT_RECT_RESOURCE = "config_mainBuiltInDisplayCutoutRectApproximation"
+WIKI_REPO_URL = "https://github.com/LineageOS/lineage_wiki.git"
 
 CORNER_TOP_NAMES = (
     "rounded_corner_radius_top",
@@ -81,6 +82,35 @@ DENSITY_PATTERNS = (
 SCREEN_SIZE_VAR_RE = re.compile(
     r"^\s*(?P<name>TARGET_SCREEN_(?P<axis>WIDTH|HEIGHT))\s*[:?+]?=\s*(?P<value>\d+)\s*$",
     re.MULTILINE,
+)
+
+TOUCH_PANEL_MAX_RE = re.compile(
+    r"^\s*(?P<prefix>[\w-]+),(?P<axis>panel-max-[xy])\s*=\s*<\s*(?P<value>\d+)\s*>\s*;",
+    re.MULTILINE,
+)
+
+TOUCH_DISPLAY_COORDS_RE = re.compile(
+    r"^\s*(?P<prefix>[\w-]+),display-coords\s*=\s*<\s*0\s+0\s+(?P<x>\d+)\s+(?P<y>\d+)\s*>\s*;",
+    re.MULTILINE,
+)
+
+TOUCH_SUPER_RESOLUTION_RE = re.compile(
+    r"^\s*(?P<prefix>[\w-]+),super-resolution-factors\s*=\s*<\s*(?P<factor>\d+)\s*>\s*;",
+    re.MULTILINE,
+)
+
+WIKI_CODENAME_RE = re.compile(r"^\s*codename:\s*['\"]?(?P<codename>[^'\"\s#]+)['\"]?\s*$", re.MULTILINE)
+WIKI_INLINE_SCREEN_RE = re.compile(
+    r"^\s*screen:\s*\{[^\n}]*\bresolution:\s*['\"]?(?P<resolution>\d+\s*[x×]\s*\d+)['\"]?",
+    re.IGNORECASE | re.MULTILINE,
+)
+WIKI_SCREEN_BLOCK_RE = re.compile(
+    r"^\s*screen:\s*\n(?P<body>(?:\s+.*\n?)+)",
+    re.MULTILINE,
+)
+WIKI_BLOCK_RESOLUTION_RE = re.compile(
+    r"^\s+resolution:\s*['\"]?(?P<resolution>\d+\s*[x×]\s*\d+)['\"]?\s*$",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 RESOLUTION_RE = re.compile(
@@ -195,6 +225,15 @@ def git_default_branch(repo_url: str) -> Optional[str]:
     return None
 
 
+def git_current_branch(path: Path) -> Optional[str]:
+    proc = run(["git", "branch", "--show-current"], cwd=path, capture=True, check=False)
+    if proc.returncode != 0:
+        return None
+
+    branch = proc.stdout.strip()
+    return branch or None
+
+
 def lineage_branch_key(branch: str) -> tuple[int, int, str]:
     """
     Sort key for LineageOS branches. Larger Android versions first.
@@ -229,6 +268,18 @@ def choose_branch(repo_url: str, requested: Optional[str]) -> str:
     raise ScriptError(f"Could not determine a branch for {repo_url}")
 
 
+def choose_branch_for_target(repo_url: str, requested: Optional[str], target: Path, *, update: bool) -> str:
+    if requested:
+        return requested
+
+    if (target / ".git").exists() and not update:
+        branch = git_current_branch(target)
+        if branch:
+            return branch
+
+    return choose_branch(repo_url, None)
+
+
 def clone_or_update_repo(
     repo_url: str,
     branch: str,
@@ -259,6 +310,34 @@ def clone_or_update_repo(
 
     eprint(f"Cloning {repo_url} ({branch}) -> {target}")
     run(cmd)
+    return target
+
+
+def clone_or_update_wiki(workdir: Path, *, update: bool, depth: Optional[int]) -> Path:
+    target = workdir / "lineage_wiki"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if (target / ".git").exists():
+        if update:
+            eprint(f"Updating existing wiki checkout: {target}")
+            run(["git", "fetch", "origin", "main"], cwd=target)
+            run(["git", "checkout", "main"], cwd=target)
+            run(["git", "pull", "--ff-only", "origin", "main"], cwd=target)
+        else:
+            eprint(f"Using existing wiki checkout: {target}")
+        return target
+
+    if target.exists() and any(target.iterdir()):
+        raise ScriptError(f"Wiki target directory exists and is not a git checkout: {target}")
+
+    cmd = ["git", "clone", "--sparse", "--filter=blob:none"]
+    if depth and depth > 0:
+        cmd += ["--depth", str(depth)]
+    cmd += [WIKI_REPO_URL, str(target)]
+
+    eprint(f"Cloning {WIKI_REPO_URL} -> {target}")
+    run(cmd)
+    run(["git", "sparse-checkout", "set", "_data/devices"], cwd=target)
     return target
 
 
@@ -326,10 +405,6 @@ def clone_lineage_dependencies(
         if not repo_url:
             continue
 
-        branch = dep.get("branch")
-        if not isinstance(branch, str) or not branch:
-            branch = choose_branch(repo_url, None)
-
         repo_name = repo_name_from_url(repo_url)
         target_path = dep.get("target_path")
         if isinstance(target_path, str) and target_path:
@@ -339,6 +414,9 @@ def clone_lineage_dependencies(
 
         target = dep_base / local_name
         try:
+            branch = dep.get("branch")
+            requested_branch = branch if isinstance(branch, str) and branch else None
+            branch = choose_branch_for_target(repo_url, requested_branch, target, update=update)
             clone_or_update_repo(repo_url, branch, target, update=update, depth=depth)
             cloned.append(target)
         except Exception as exc:
@@ -359,7 +437,7 @@ def interesting_text_files(root: Path) -> Iterator[Path]:
         "product.prop",
         "lineage.mk",
     }
-    wanted_suffixes = {".mk", ".prop", ".txt", ".md", ".xml", ".bp"}
+    wanted_suffixes = {".mk", ".prop", ".txt", ".md", ".xml", ".bp", ".dts", ".dtsi"}
 
     for path in root.rglob("*"):
         if not path.is_file():
@@ -443,7 +521,136 @@ def find_makefile_screen_resolution(
     return candidate
 
 
-def find_resolution(roots: list[Path], *, natural_landscape: bool) -> Optional[ResolutionCandidate]:
+def find_touch_panel_resolution(
+    path: Path,
+    text: str,
+    *,
+    natural_landscape: bool,
+) -> list[ResolutionCandidate]:
+    candidates: list[ResolutionCandidate] = []
+
+    panel_values: dict[str, dict[str, tuple[int, str]]] = {}
+    for m in TOUCH_PANEL_MAX_RE.finditer(text):
+        prefix = m.group("prefix")
+        axis = "x" if m.group("axis").endswith("-x") else "y"
+        value = int(m.group("value"))
+        if 120 <= value <= 10000:
+            panel_values.setdefault(prefix, {})[axis] = (value, m.group(0).strip())
+
+    for values in panel_values.values():
+        if "x" not in values or "y" not in values:
+            continue
+
+        x, x_line = values["x"]
+        y, y_line = values["y"]
+        candidate = make_resolution_candidate(
+            x,
+            y,
+            source=path,
+            line=f"{x_line} {y_line}",
+            score=85,
+            natural_landscape=natural_landscape,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+
+    factors: dict[str, int] = {}
+    for m in TOUCH_SUPER_RESOLUTION_RE.finditer(text):
+        factor = int(m.group("factor"))
+        if factor > 1:
+            factors[m.group("prefix")] = factor
+
+    for m in TOUCH_DISPLAY_COORDS_RE.finditer(text):
+        factor = factors.get(m.group("prefix"))
+        if factor is None:
+            continue
+
+        raw_x = int(m.group("x"))
+        raw_y = int(m.group("y"))
+        if raw_x % factor != 0 or raw_y % factor != 0:
+            continue
+
+        candidate = make_resolution_candidate(
+            raw_x // factor,
+            raw_y // factor,
+            source=path,
+            line=f"{m.group(0).strip()} with {m.group('prefix')},super-resolution-factors = <{factor}>",
+            score=75,
+            natural_landscape=natural_landscape,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+
+    return candidates
+
+
+def wiki_device_files(wiki_root: Path, codename: str) -> Iterator[Path]:
+    devices_dir = wiki_root / "_data" / "devices"
+    if not devices_dir.is_dir():
+        return
+
+    target = codename.casefold()
+    for path in devices_dir.glob("*.yml"):
+        try:
+            text = read_text_lossy(path)
+        except OSError:
+            continue
+
+        m = WIKI_CODENAME_RE.search(text)
+        if m and m.group("codename").casefold() == target:
+            yield path
+
+
+def find_wiki_resolution(
+    wiki_root: Optional[Path],
+    codename: str,
+    *,
+    natural_landscape: bool,
+) -> list[ResolutionCandidate]:
+    if wiki_root is None:
+        return []
+
+    candidates: list[ResolutionCandidate] = []
+    for path in wiki_device_files(wiki_root, codename):
+        try:
+            text = read_text_lossy(path)
+        except OSError:
+            continue
+
+        match = WIKI_INLINE_SCREEN_RE.search(text)
+        if match is None:
+            block = WIKI_SCREEN_BLOCK_RE.search(text)
+            if block is not None:
+                match = WIKI_BLOCK_RESOLUTION_RE.search(block.group("body"))
+        if match is None:
+            continue
+
+        resolution = match.group("resolution")
+        res_match = RESOLUTION_RE.search(resolution)
+        if res_match is None:
+            continue
+
+        candidate = make_resolution_candidate(
+            int(res_match.group("a")),
+            int(res_match.group("b")),
+            source=path,
+            line=f"screen resolution: {resolution}",
+            score=80,
+            natural_landscape=natural_landscape,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+
+    return candidates
+
+
+def find_resolution(
+    roots: list[Path],
+    *,
+    natural_landscape: bool,
+    wiki_root: Optional[Path],
+    codename: str,
+) -> Optional[ResolutionCandidate]:
     candidates: list[ResolutionCandidate] = []
 
     for root in roots:
@@ -460,6 +667,14 @@ def find_resolution(roots: list[Path], *, natural_landscape: bool) -> Optional[R
             )
             if makefile_candidate is not None:
                 candidates.append(makefile_candidate)
+
+            candidates.extend(
+                find_touch_panel_resolution(
+                    path,
+                    text,
+                    natural_landscape=natural_landscape,
+                )
+            )
 
             for line in text.splitlines():
                 for m in RESOLUTION_RE.finditer(line):
@@ -481,6 +696,8 @@ def find_resolution(roots: list[Path], *, natural_landscape: bool) -> Optional[R
                     )
                     if candidate is not None:
                         candidates.append(candidate)
+
+    candidates.extend(find_wiki_resolution(wiki_root, codename, natural_landscape=natural_landscape))
 
     if not candidates:
         return None
@@ -1051,6 +1268,7 @@ def build_findings(
     *,
     oem: str,
     codename: str,
+    wiki_root: Optional[Path],
     x_res_override: Optional[int],
     y_res_override: Optional[int],
     density_override: Optional[int],
@@ -1068,7 +1286,12 @@ def build_findings(
         x_res, y_res = x_res_override, y_res_override
         notes.append("Using resolution from command-line overrides.")
     else:
-        candidate = find_resolution(roots, natural_landscape=natural_landscape)
+        candidate = find_resolution(
+            roots,
+            natural_landscape=natural_landscape,
+            wiki_root=wiki_root,
+            codename=codename,
+        )
         if candidate is None:
             raise ScriptError("Could not find display resolution. Pass --x-res and --y-res.")
         x_res, y_res = candidate.x, candidate.y
@@ -1250,6 +1473,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     parser.add_argument("--clone-dependencies", action="store_true", help="Also clone repositories listed in lineage.dependencies")
     parser.add_argument("--max-deps", type=int, default=8, help="Maximum lineage.dependencies repositories to clone")
+    parser.add_argument("--use-wiki", action="store_true", help="Use LineageOS wiki device YAML as a fallback for display resolution")
 
     parser.add_argument("--x-res", type=int, help="Override detected display x resolution")
     parser.add_argument("--y-res", type=int, help="Override detected display y resolution")
@@ -1279,13 +1503,13 @@ def main(argv: list[str]) -> int:
         oem = args.oem.strip().lower()
         codename = args.codename.strip().lower()
         repo_url = args.repo_url or make_repo_url(args.org, oem, codename)
-        branch = choose_branch(repo_url, args.branch)
-
         repo_name = repo_name_from_url(repo_url)
+        target = args.workdir / repo_name
+        branch = choose_branch_for_target(repo_url, args.branch, target, update=args.update)
         root = clone_or_update_repo(
             repo_url,
             branch,
-            args.workdir / repo_name,
+            target,
             update=args.update,
             depth=args.depth,
         )
@@ -1302,10 +1526,18 @@ def main(argv: list[str]) -> int:
             )
             search_roots.extend(deps)
 
+        wiki_root: Optional[Path] = None
+        if args.use_wiki:
+            try:
+                wiki_root = clone_or_update_wiki(args.workdir / "_wiki", update=args.update, depth=args.depth)
+            except Exception as exc:
+                eprint(f"Warning: could not use LineageOS wiki fallback: {exc}")
+
         findings = build_findings(
             search_roots,
             oem=oem,
             codename=codename,
+            wiki_root=wiki_root,
             x_res_override=args.x_res,
             y_res_override=args.y_res,
             density_override=args.density,

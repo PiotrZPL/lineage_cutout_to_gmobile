@@ -39,10 +39,22 @@ display-panels/xiaomi,sweet.json
 
 If `--branch` is omitted, the script tries to use the newest available `lineage-*` branch. If detection misses a value, provide overrides such as `--x-res`, `--y-res`, or `--density`.
 
+For device trees that do not publish the screen resolution in their own README or makefiles, add `--use-wiki` to clone the LineageOS wiki metadata and use `_data/devices/*.yml` as a fallback.
+
+To generate Xiaomi devices from a saved LineageOS wiki HTML snippet:
+
+```sh
+python3 generate_xiaomi_panels.py \
+  --html __pycache__/xiaomi.html \
+  --workdir ./lineage-device-work \
+  --output-dir ./display-panels
+```
+
 ## Useful Options
 
 - `--repo-url URL`: use a specific device repository instead of `https://github.com/LineageOS/android_device_<oem>_<codename>.git`
 - `--clone-dependencies`: also clone repositories listed in `lineage.dependencies`
+- `--use-wiki`: use LineageOS wiki device YAML as a fallback for display resolution
 - `--compatible STEM`: choose the output file stem, for example `xiaomi,sweet`
 - `--output-file PATH`: write to an exact file path
 - `--corner-format {auto,border-radius,corner-radii}`: choose how rounded corners are emitted
@@ -51,4 +63,3 @@ If `--branch` is omitted, the script tries to use the newest available `lineage-
 - `--no-validate`: skip `json-glib-validate`
 
 Run `python3 main.py --help` for the complete CLI reference.
-
