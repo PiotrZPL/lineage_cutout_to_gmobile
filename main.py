@@ -78,6 +78,11 @@ DENSITY_PATTERNS = (
     re.compile(r"\bqemu\.sf\.lcd_density\s*[:?+]?=\s*(\d+)\b"),
 )
 
+SCREEN_SIZE_VAR_RE = re.compile(
+    r"^\s*(?P<name>TARGET_SCREEN_(?P<axis>WIDTH|HEIGHT))\s*[:?+]?=\s*(?P<value>\d+)\s*$",
+    re.MULTILINE,
+)
+
 RESOLUTION_RE = re.compile(
     r"\b(?P<a>[4-9]\d{2,4}|[1-3]\d{3,4})\s*[x×]\s*(?P<b>[4-9]\d{2,4}|[1-3]\d{3,4})\b",
     re.IGNORECASE,
@@ -391,6 +396,53 @@ def score_resolution(path: Path, line: str) -> int:
     return score
 
 
+def make_resolution_candidate(
+    x: int,
+    y: int,
+    *,
+    source: Path,
+    line: str,
+    score: int,
+    natural_landscape: bool,
+) -> Optional[ResolutionCandidate]:
+    if not plausible_resolution_pair(x, y):
+        return None
+
+    if natural_landscape:
+        x, y = max(x, y), min(x, y)
+
+    return ResolutionCandidate(x=x, y=y, source=source, line=line, score=score)
+
+
+def find_makefile_screen_resolution(
+    path: Path,
+    text: str,
+    *,
+    natural_landscape: bool,
+) -> Optional[ResolutionCandidate]:
+    values: dict[str, tuple[int, str]] = {}
+    for m in SCREEN_SIZE_VAR_RE.finditer(text):
+        axis = m.group("axis")
+        value = int(m.group("value"))
+        if 120 <= value <= 10000:
+            values[axis] = (value, m.group(0).strip())
+
+    if "WIDTH" not in values or "HEIGHT" not in values:
+        return None
+
+    width, width_line = values["WIDTH"]
+    height, height_line = values["HEIGHT"]
+    candidate = make_resolution_candidate(
+        width,
+        height,
+        source=path,
+        line=f"{width_line}; {height_line}",
+        score=95,
+        natural_landscape=natural_landscape,
+    )
+    return candidate
+
+
 def find_resolution(roots: list[Path], *, natural_landscape: bool) -> Optional[ResolutionCandidate]:
     candidates: list[ResolutionCandidate] = []
 
@@ -401,28 +453,34 @@ def find_resolution(roots: list[Path], *, natural_landscape: bool) -> Optional[R
             except OSError:
                 continue
 
+            makefile_candidate = find_makefile_screen_resolution(
+                path,
+                text,
+                natural_landscape=natural_landscape,
+            )
+            if makefile_candidate is not None:
+                candidates.append(makefile_candidate)
+
             for line in text.splitlines():
                 for m in RESOLUTION_RE.finditer(line):
                     a = int(m.group("a"))
                     b = int(m.group("b"))
-
-                    if not plausible_resolution_pair(a, b):
-                        continue
 
                     if natural_landscape:
                         x, y = max(a, b), min(a, b)
                     else:
                         x, y = min(a, b), max(a, b)
 
-                    candidates.append(
-                        ResolutionCandidate(
-                            x=x,
-                            y=y,
-                            source=path,
-                            line=line.strip(),
-                            score=score_resolution(path, line),
-                        )
+                    candidate = make_resolution_candidate(
+                        x,
+                        y,
+                        source=path,
+                        line=line.strip(),
+                        score=score_resolution(path, line),
+                        natural_landscape=False,
                     )
+                    if candidate is not None:
+                        candidates.append(candidate)
 
     if not candidates:
         return None
